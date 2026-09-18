@@ -1,0 +1,25 @@
+[package]
+name = "grover"
+version = "0.1.0"
+edition = "2021"
+description = "Grover: a garbled Groth16 verifier, the paper's main-body construction"
+
+[dependencies]
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+ark-std = "0.5"
+ark-serialize = "0.5"
+sha2 = "0.10"
+duty-free-bits = { git = "https://github.com/alpenlabs/duty-free-bits", rev = "594fb4de28fac1f76a93cf9a10cee7a0262b0a52" }
+
+[dev-dependencies]
+ark-groth16 = "0.5"
+ark-relations = "0.5"
+ark-snark = "0.5"
+
+[profile.test]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2
