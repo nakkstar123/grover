@@ -21,9 +21,10 @@
 //! # Parameters
 //!
 //! `n = 254`, `κ = 128`, twelve field entries per point,
-//! `N_base = 10,758`. [`bits::size_report`] measures the garbled program;
-//! [`bits::N_BASE`] and [`bits::aggregate_statistical_bits`] give the entry
-//! count and the resulting statistical security.
+//! `N_base = 10,758`, and `κ` more entries per statement scalar left to the
+//! evaluator. [`bits::size_report`] measures the garbled program; [`bits::n_base`]
+//! and [`bits::aggregate_statistical_bits`] give the entry count and the resulting
+//! statistical security.
 
 pub mod bits;
 pub mod curve;

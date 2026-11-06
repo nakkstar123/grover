@@ -1,18 +1,25 @@
 //! `Π_G`: the scheme over groups, for binary coefficients.
 //!
-//! The evaluator's input is a proof `(A, B, C)`, `A, C ∈ G_1`, `B` on the twist;
-//! the garbler's input is the secret `s`. Each point gets an Argo encoding:
-//! `n = 254` entries for `A` (coefficients the binary digits of `−k`), `κ = 128`
-//! entries each for `B` and `C` (coefficients the shared vector `c⃗`). The keys
-//! of `B` share the scalar `k` across bases `U_t`: `K^B_t = k·U_t`. The program
-//! is the bases, the commitments `h_t = H(sid, t, K_t)` to
-//! `K_t = e(R, U_t) + e(K^C_t, H_1) + c_t·D`, and the pad `ct = s ⊕ H(sid, c⃗)`.
+//! The evaluator's input is a proof `(A, B, C)`, `A, C ∈ G_1`, `B` on the twist,
+//! and `ℓ ≥ 0` statement scalars `ξ_i ∈ F_r`; the garbler's input is the secret
+//! `s`. Each point gets an Argo encoding: `n = 254` entries for `A` (coefficients
+//! the binary digits of `−k`), `κ = 128` entries each for `B` and `C`
+//! (coefficients the shared vector `c⃗`). The keys of `B` share the scalar `k`
+//! across bases `U_t`: `K^B_t = k·U_t`. Each `ξ_i` gets `κ` labels
+//! `z_{i,t} = c_t·ξ_i + ρ_{i,t}`, which define `K^X_t = Σ_i ρ_{i,t}·vk_i`. The
+//! program is the bases, the commitments `h_t = H(sid, t, K_t)` to
+//! `K_t = e(R, U_t) + e(K^C_t, H_1) + e(K^X_t, H_2) + c_t·D`, and the pad
+//! `ct = s ⊕ H(sid, c⃗)`.
 //!
 //! Evaluation: if `r·B ≠ O`, then `B ∉ G_2` and the encoding of `B` leaks `c⃗`
-//! via `r·⟦B⟧_t = c_t·(r·B)`. Otherwise compute `P = e(A,B) + e(C,H_1) − D`;
-//! `P = 0` gives `⊥`, else `Q = Σ 2^i·⟦A⟧_i = −k·A + R` and
-//! `Y_t = e(A, ⟦B⟧_t) + e(Q, U_t) + e(⟦C⟧_t, H_1) = c_t·P + K_t` singles out
-//! `c_t` against the commitment, and `s` is opened.
+//! via `r·⟦B⟧_t = c_t·(r·B)`. Otherwise compute
+//! `P = e(A,B) + e(C,H_1) + e(X',H_2) − D` for `X' = Σ_i ξ_i·vk_i`; `P = 0` gives
+//! `⊥`, else `Q = Σ 2^i·⟦A⟧_i = −k·A + R`, `⟦X'⟧_t = Σ_i z_{i,t}·vk_i` and
+//! `Y_t = e(A, ⟦B⟧_t) + e(Q, U_t) + e(⟦C⟧_t, H_1) + e(⟦X'⟧_t, H_2) = c_t·P + K_t`
+//! singles out `c_t` against the commitment, and `s` is opened.
+//!
+//! With `ℓ = 0` the statement is fixed at garbling time and folded into `D`, and
+//! the scalars, their labels and `K^X_t` all vanish.
 //!
 //! `U_t`, `M_i`, `K^C_t` are sampled uniformly over the whole group (identity
 //! included), matching the theorem exactly: shifting a uniform mask by a fixed
@@ -34,20 +41,38 @@ pub const N: usize = 254;
 pub const KAPPA: usize = 128;
 
 /// The fixed data of the Groth16 verifier, normalized so that a proof is valid
-/// iff `e(A, B) + e(C, H_1) − D = 0`. With the statement fixed at garbling time,
-/// `H_1 = −δ` and `D = e(α, β) + e(X, γ)`.
+/// iff `e(A, B) + e(C, H_1) + e(X', H_2) − D = 0`, for `X' = Σ_i ξ_i·vk_i` over the
+/// statement scalars left to the evaluator. Then `H_1 = −δ`, `H_2 = −γ` and
+/// `D = e(α, β) + e(X_0, γ)`, where `X_0` is `vk_0` plus every statement term
+/// fixed at garbling time.
 #[derive(Clone, Debug)]
 pub struct Verifier {
     /// The element of `G_2` paired with `C`.
     pub h1: Twist,
-    /// The constant absorbing `e(α, β)` and the statement.
+    /// The element of `G_2` paired with the statement.
+    pub h2: Twist,
+    /// The bases `vk_i` of the `ℓ` statement scalars left to the evaluator.
+    pub input_bases: Vec<G1>,
+    /// The constant absorbing `e(α, β)` and the fixed part of the statement.
     pub d: Gt,
 }
 
 impl Verifier {
-    /// The verdict `P`, defined when `B ∈ G_2`.
+    /// `Σ_i scalars[i]·vk_i`. On the statement this is `X'`; on the labels of entry
+    /// `t` it is `⟦X'⟧_t`, and on the offsets of entry `t` it is `K^X_t`.
+    fn statement_point(&self, scalars: impl Iterator<Item = Fr>) -> G1 {
+        self.input_bases
+            .iter()
+            .zip(scalars)
+            .fold(G1::zero(), |acc, (vk, z)| acc + *vk * z)
+    }
+
+    /// The verdict `P`, defined when `B ∈ G_2` and there are `ℓ` statement scalars.
     pub fn verdict(&self, x: &ProofPoints) -> Option<Gt> {
-        in_g2(&x.b).then(|| multi_pair([x.a, x.c], [x.b, self.h1]) - self.d)
+        (in_g2(&x.b) && x.inputs.len() == self.input_bases.len()).then(|| {
+            let statement = self.statement_point(x.inputs.iter().copied());
+            multi_pair([x.a, x.c, statement], [x.b, self.h1, self.h2]) - self.d
+        })
     }
 
     /// `Valid_G(x)`: `r·B = O` and `P = 0`.
@@ -58,7 +83,7 @@ impl Verifier {
 
 /// A proof as group elements: the evaluator's input at this layer. `b` is a twist
 /// point; whether it lies in `G_2` is part of the function.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofPoints {
     /// `A ∈ G_1`.
     pub a: G1,
@@ -66,6 +91,8 @@ pub struct ProofPoints {
     pub b: Twist,
     /// `C ∈ G_1`.
     pub c: G1,
+    /// The statement scalars `ξ_i`.
+    pub inputs: Vec<Fr>,
 }
 
 /// The garbled program `f~_G`.
@@ -93,9 +120,11 @@ pub struct GroupEncodingInfo {
     pub b_keys: Vec<Twist>,
     /// The keys `K^C_t` on `C`.
     pub c_keys: Vec<G1>,
+    /// The offsets `ρ_{i,t}` on the statement, indexed by scalar and then entry.
+    pub input_keys: Vec<Vec<Fr>>,
 }
 
-/// The encoding `x~_G`: the three Argo encodings.
+/// The encoding `x~_G`: the three Argo encodings and the statement labels.
 #[derive(Clone, Debug)]
 pub struct GroupEncoding {
     /// `⟦A⟧_i = b_i·A + M_i`.
@@ -104,6 +133,8 @@ pub struct GroupEncoding {
     pub b: Vec<Twist>,
     /// `⟦C⟧_t = c_t·C + K^C_t`.
     pub c: Vec<G1>,
+    /// `z_{i,t} = c_t·ξ_i + ρ_{i,t}`, indexed by scalar and then entry.
+    pub inputs: Vec<Vec<Fr>>,
 }
 
 /// `c·V`, for a binary coefficient: the identity map or the zero map.
@@ -189,10 +220,20 @@ impl Pgs for GroupScheme {
         let a_keys: Vec<G1> = (0..N).map(|_| G1::rand(rng)).collect();
         let r_mask = weighted_sum(&a_keys);
         let b_keys: Vec<Twist> = bases.iter().map(|u| *u * k).collect();
+        let input_keys: Vec<Vec<Fr>> = self
+            .vk
+            .input_bases
+            .iter()
+            .map(|_| (0..KAPPA).map(|_| Fr::rand(rng)).collect())
+            .collect();
 
         let commits = (0..KAPPA)
             .map(|t| {
-                let mut n = multi_pair([r_mask, c_keys[t]], [bases[t], self.vk.h1]);
+                let x_key = self.vk.statement_point(input_keys.iter().map(|rho| rho[t]));
+                let mut n = multi_pair(
+                    [r_mask, c_keys[t], x_key],
+                    [bases[t], self.vk.h1, self.vk.h2],
+                );
                 if coeffs[t] {
                     n += self.vk.d;
                 }
@@ -209,11 +250,17 @@ impl Pgs for GroupScheme {
                 coeffs,
                 b_keys,
                 c_keys,
+                input_keys,
             },
         )
     }
 
     fn encode(&self, ek: &GroupEncodingInfo, x: &ProofPoints) -> GroupEncoding {
+        assert_eq!(
+            x.inputs.len(),
+            ek.input_keys.len(),
+            "one statement scalar per garbled input"
+        );
         GroupEncoding {
             a: ek
                 .a_coeffs
@@ -233,15 +280,31 @@ impl Pgs for GroupScheme {
                 .zip(&ek.c_keys)
                 .map(|(&c, key)| phi(c, &x.c) + *key)
                 .collect(),
+            inputs: x
+                .inputs
+                .iter()
+                .zip(&ek.input_keys)
+                .map(|(xi, keys)| {
+                    ek.coeffs
+                        .iter()
+                        .zip(keys)
+                        .map(|(&c, rho)| phi(c, xi) + *rho)
+                        .collect()
+                })
+                .collect(),
         }
     }
 
     fn eval(&self, program: &GroupProgram, enc: &GroupEncoding, x: &ProofPoints) -> Option<Secret> {
         // A malformed or truncated program must not panic: the party
         // publishing it is the one that wants disclosure not to happen.
+        let ell = self.vk.input_bases.len();
         if enc.a.len() != N
             || enc.b.len() != KAPPA
             || enc.c.len() != KAPPA
+            || enc.inputs.len() != ell
+            || enc.inputs.iter().any(|z| z.len() != KAPPA)
+            || x.inputs.len() != ell
             || program.bases.len() != KAPPA
             || program.commits.len() != KAPPA
         {
@@ -267,7 +330,8 @@ impl Pgs for GroupScheme {
         }
 
         // Step 2: the verdict in the clear, then the commitments.
-        let p = multi_pair([x.a, x.c], [x.b, self.vk.h1]) - self.vk.d;
+        let statement = self.vk.statement_point(x.inputs.iter().copied());
+        let p = multi_pair([x.a, x.c, statement], [x.b, self.vk.h1, self.vk.h2]) - self.vk.d;
         if p.is_zero() {
             return None;
         }
@@ -279,7 +343,11 @@ impl Pgs for GroupScheme {
         let q = weighted_sum(&enc.a);
         let mut found = Vec::with_capacity(KAPPA);
         for t in 0..KAPPA {
-            let y = multi_pair([x.a, q, enc.c[t]], [enc.b[t], program.bases[t], self.vk.h1]);
+            let x_label = self.vk.statement_point(enc.inputs.iter().map(|z| z[t]));
+            let y = multi_pair(
+                [x.a, q, enc.c[t], x_label],
+                [enc.b[t], program.bases[t], self.vk.h1, self.vk.h2],
+            );
             // The two candidate keys are Y_t itself (c_t = 0) and Y_t − P (c_t = 1).
             // Exactly one should match the commitment; anything else is malformed.
             let matches_zero = h_com(&self.sid, t, &y) == program.commits[t];

@@ -1,11 +1,11 @@
 //! A synthetic verifier with a matched valid proof, for the tests, and a twist
 //! point outside `G_2`.
 
-use crate::curve::{b2, pair, Twist, G1};
+use crate::curve::{b2, multi_pair, Gt, Twist, G1};
 use crate::group::{ProofPoints, Verifier};
 use ark_bn254::{Fq2, Fr, G2Affine};
 use ark_ec::{AffineRepr, PrimeGroup};
-use ark_ff::{Field, One, UniformRand};
+use ark_ff::{Field, One, UniformRand, Zero};
 use ark_std::rand::RngCore;
 
 /// A verifier with a matched valid proof and an invalid one.
@@ -18,21 +18,44 @@ pub struct Instance {
     pub invalid: ProofPoints,
 }
 
-/// Choose `D` so that the proof with discrete logarithms `(a, b, c)` verifies; the
-/// invalid proof bumps `a`.
+/// A verifier whose whole statement is fixed at garbling time.
 pub fn synthetic(rng: &mut impl RngCore) -> Instance {
+    synthetic_with_inputs(rng, 0)
+}
+
+/// Choose `D` so that the proof with discrete logarithms `(a, b, c)` and `ℓ` random
+/// statement scalars verifies; the invalid proof bumps `a`.
+pub fn synthetic_with_inputs(rng: &mut impl RngCore, ell: usize) -> Instance {
     let g1 = G1::generator();
     let g2 = Twist::generator();
     let (a, b, c, eta) = (Fr::rand(rng), Fr::rand(rng), Fr::rand(rng), Fr::rand(rng));
     let h1 = g2 * eta;
+    let input_bases: Vec<G1> = (0..ell).map(|_| G1::rand(rng)).collect();
+    let inputs: Vec<Fr> = (0..ell).map(|_| Fr::rand(rng)).collect();
+    let h2 = if ell == 0 {
+        Twist::zero()
+    } else {
+        g2 * Fr::rand(rng)
+    };
     let mk = |aa: Fr| ProofPoints {
         a: g1 * aa,
         b: g2 * b,
         c: g1 * c,
+        inputs: inputs.clone(),
     };
     let valid = mk(a);
-    let d = pair(&valid.a, &valid.b) + pair(&valid.c, &h1);
-    let vk = Verifier { h1, d };
+    let mut vk = Verifier {
+        h1,
+        h2,
+        input_bases,
+        d: Gt::zero(),
+    };
+    let statement = vk
+        .input_bases
+        .iter()
+        .zip(&inputs)
+        .fold(G1::zero(), |acc, (vk_i, xi)| acc + *vk_i * *xi);
+    vk.d = multi_pair([valid.a, valid.c, statement], [valid.b, h1, h2]);
     let invalid = mk(a + Fr::one());
     assert!(vk.is_valid(&valid));
     assert!(!vk.is_valid(&invalid));

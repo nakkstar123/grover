@@ -5,10 +5,10 @@
 mod common;
 
 use ark_bn254::{Fq, Fr};
-use ark_ff::{BigInteger, Field, One, PrimeField, Zero};
-use common::{synthetic, twist_point_off_g2};
-use grover::bits::{size_report, BinToField, Block, ProofBits};
-use grover::curve::{fq_to_block, h_key, in_g2, xor, Secret, Twist, G1};
+use ark_ff::{BigInteger, Field, One, PrimeField, UniformRand, Zero};
+use common::{synthetic, synthetic_with_inputs, twist_point_off_g2};
+use grover::bits::{n_base, size_report, BinToField, Block, ProofBits};
+use grover::curve::{fq_to_block, fr_to_block, h_key, in_g2, xor, Secret, Twist, G1};
 use grover::field::{FieldScheme, ProofCoords};
 use grover::group::{GroupScheme, ProofPoints, KAPPA};
 use grover::pgs::{Pgs, PublicMap};
@@ -59,7 +59,7 @@ fn group_layer_discloses_when_b_is_off_the_subgroup() {
 
     let bad = ProofPoints {
         b: twist_point_off_g2(&mut rng),
-        ..inst.valid
+        ..inst.valid.clone()
     };
     assert!(!in_g2(&bad.b));
     let enc = scheme.encode(&ek, &bad);
@@ -82,15 +82,15 @@ fn group_layer_accepts_the_point_at_infinity() {
     let cases = [
         ProofPoints {
             a: G1::zero(),
-            ..inst.valid
+            ..inst.valid.clone()
         },
         ProofPoints {
             b: Twist::zero(),
-            ..inst.valid
+            ..inst.valid.clone()
         },
         ProofPoints {
             c: G1::zero(),
-            ..inst.valid
+            ..inst.valid.clone()
         },
     ];
     for x in cases {
@@ -143,6 +143,7 @@ fn reusing_encoding_information_recovers_the_secret() {
         a: inst.valid.a * a,
         b: inst.valid.b * a.inverse().unwrap(),
         c: inst.valid.c,
+        inputs: Vec::new(),
     };
     assert!(inst.vk.is_valid(&other) && inst.vk.is_valid(&inst.valid));
 
@@ -201,7 +202,7 @@ fn field_layer_discloses_off_curve_coordinates() {
     let valid = ProofCoords::from_points(&inst.valid).unwrap();
 
     // A off the curve.
-    let mut x = valid;
+    let mut x = valid.clone();
     x.a.1 += Fq::one();
     assert!(x.to_points().is_none());
     let enc = scheme.encode(&ek, &x);
@@ -212,7 +213,7 @@ fn field_layer_discloses_off_curve_coordinates() {
     );
 
     // B off the twist.
-    let mut x = valid;
+    let mut x = valid.clone();
     x.b.0.c1 += Fq::one();
     assert!(x.to_points().is_none());
     let enc = scheme.encode(&ek, &x);
@@ -223,7 +224,7 @@ fn field_layer_discloses_off_curve_coordinates() {
     );
 
     // C off the curve.
-    let mut x = valid;
+    let mut x = valid.clone();
     x.c.0 += Fq::one();
     let enc = scheme.encode(&ek, &x);
     assert_eq!(
@@ -257,7 +258,7 @@ fn field_layer_discloses_b_off_the_subgroup() {
 
     let bad = ProofPoints {
         b: twist_point_off_g2(&mut rng),
-        ..inst.valid
+        ..inst.valid.clone()
     };
     let x = ProofCoords::from_points(&bad).unwrap();
     let enc = scheme.encode(&ek, &x);
@@ -286,7 +287,10 @@ fn field_layer_discloses_on_a_proof_aimed_at_the_masks() {
         .expect("−k has a set bit");
     let a = ek_g.a_keys[i];
 
-    let aimed = ProofPoints { a, ..inst.valid };
+    let aimed = ProofPoints {
+        a,
+        ..inst.valid.clone()
+    };
     assert!(!inst.vk.is_valid(&aimed), "the aimed proof is invalid");
     let x = ProofCoords::from_points(&aimed).unwrap();
     let enc = scheme.encode(&ek_f, &x);
@@ -364,14 +368,14 @@ fn bit_layer_discloses_malformed_inputs() {
     let coords = ProofCoords::from_points(&inst.valid).unwrap();
 
     // Off-curve A, given as bits.
-    let mut off = coords;
+    let mut off = coords.clone();
     off.a.0 += Fq::one();
     let x = ProofBits::from_coords(&off);
     let enc = scheme.encode(&ek, &x);
     assert_eq!(scheme.eval(&program, &enc, &x), Some(SECRET), "off-curve A");
 
     // Off-curve B, given as bits.
-    let mut off = coords;
+    let mut off = coords.clone();
     off.b.1.c0 += Fq::one();
     let x = ProofBits::from_coords(&off);
     let enc = scheme.encode(&ek, &x);
@@ -380,7 +384,7 @@ fn bit_layer_discloses_malformed_inputs() {
     // B on the twist but off G_2, given as bits.
     let bad = ProofPoints {
         b: twist_point_off_g2(&mut rng),
-        ..inst.valid
+        ..inst.valid.clone()
     };
     let x = ProofBits::from_coords(&ProofCoords::from_points(&bad).unwrap());
     let enc = scheme.encode(&ek, &x);
@@ -428,8 +432,27 @@ fn exact_program_size() {
 fn n_base_matches_field_layout() {
     use grover::bits::N_BASE;
     use grover::field::FieldLayout;
-    assert_eq!(N_BASE, FieldLayout::new().base_field_entries());
+    assert_eq!(N_BASE, FieldLayout::new(0).base_field_entries());
     assert_eq!(N_BASE, 10_758);
+    assert_eq!(n_base(1), FieldLayout::new(1).base_field_entries());
+    assert_eq!(n_base(5), 10_758 + 5 * 128);
+}
+
+/// Each statement scalar adds one DFB instance with `κ` labels to the program,
+/// and nothing to `f~_G`.
+#[test]
+fn exact_program_size_with_a_statement_scalar() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = bit_scheme(inst.vk, SID.to_vec());
+    let (program, _) = scheme.garble(&mut rng, &SECRET);
+    let report = size_report(&program);
+
+    assert_eq!(report.group_bits, 98_432);
+    // 905,984 fixed per instance, 611 per label.
+    assert_eq!(report.dfb_ciphertext_bits, 13_821_010 + 905_984 + 128 * 611);
+    assert_eq!(report.dfb_output_decoding_bits, 6_573_138 + 128 * 611);
+    assert_eq!(report.total_bits(), 21_554_980);
 }
 
 // ---------------------------------------------------- defensive length checks
@@ -449,7 +472,7 @@ fn group_layer_rejects_a_truncated_program() {
 }
 
 /// The same, at the bit layer: a program or encoding with fewer than the
-/// expected eight per-block instances must disclose nothing rather than
+/// expected per-block instances must disclose nothing rather than
 /// panic. `BitEncoder::eval`'s `Pgs::Output` is not `Option`-shaped, so it
 /// degrades to an empty `FieldEncoding`, which `FieldScheme::eval`'s existing
 /// length guard then rejects.
@@ -481,7 +504,7 @@ fn field_layer_discloses_on_a_proof_aimed_at_bs_mask() {
         .expect("c⃗ has a set bit");
     let aimed = ProofPoints {
         b: ek_g.b_keys[t],
-        ..inst.valid
+        ..inst.valid.clone()
     };
     assert!(!inst.vk.is_valid(&aimed), "the aimed proof is invalid");
     let x = ProofCoords::from_points(&aimed).unwrap();
@@ -491,6 +514,493 @@ fn field_layer_discloses_on_a_proof_aimed_at_bs_mask() {
         Some(SECRET),
         "a proof aimed at B's mask {t} must still disclose"
     );
+}
+
+// -------------------------------------------------------- variable statement
+
+/// The statement counts covered: one live scalar as in SP1, and several.
+const ELLS: [usize; 3] = [1, 2, 5];
+
+/// The same program decides every statement, which is the point of leaving it to
+/// the evaluator. Encoding twice under one key is only sound here because the test
+/// plays both parties; see `reusing_statement_labels_recovers_the_secret`.
+#[test]
+fn group_layer_decides_the_statement_online() {
+    let mut rng = ark_std::test_rng();
+    for ell in ELLS {
+        let inst = synthetic_with_inputs(&mut rng, ell);
+        let scheme = group_scheme(&inst.vk);
+        let (program, ek) = scheme.garble(&mut rng, &SECRET);
+
+        let enc = scheme.encode(&ek, &inst.valid);
+        assert_eq!(scheme.eval(&program, &enc, &inst.valid), None, "ell {ell}");
+
+        let enc = scheme.encode(&ek, &inst.invalid);
+        assert_eq!(
+            scheme.eval(&program, &enc, &inst.invalid),
+            Some(SECRET),
+            "ell {ell}"
+        );
+
+        // A valid proof, but each statement scalar in turn is not the one it proves.
+        for i in 0..ell {
+            let mut other = inst.valid.clone();
+            other.inputs[i] += Fr::one();
+            assert!(!inst.vk.is_valid(&other));
+            let enc = scheme.encode(&ek, &other);
+            assert_eq!(
+                scheme.eval(&program, &enc, &other),
+                Some(SECRET),
+                "ell {ell}, scalar {i}"
+            );
+        }
+    }
+}
+
+/// Folding a scalar into `D` and leaving it to the evaluator decide the same proofs.
+#[test]
+fn group_layer_folded_and_variable_statements_agree() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 2);
+    let mut folded = inst.vk.clone();
+    let first = inst.vk.input_bases[0] * inst.valid.inputs[0];
+    folded.d -= grover::curve::pair(&first, &inst.vk.h2);
+    folded.input_bases = inst.vk.input_bases[1..].to_vec();
+    let keep = |x: &ProofPoints| ProofPoints {
+        inputs: x.inputs[1..].to_vec(),
+        ..x.clone()
+    };
+
+    let variable = group_scheme(&inst.vk);
+    let folded_scheme = group_scheme(&folded);
+    let (program_v, ek_v) = variable.garble(&mut rng, &SECRET);
+    let (program_f, ek_f) = folded_scheme.garble(&mut rng, &SECRET);
+    for (x, want) in [(&inst.valid, None), (&inst.invalid, Some(SECRET))] {
+        assert_eq!(folded.is_valid(&keep(x)), inst.vk.is_valid(x));
+        let enc = variable.encode(&ek_v, x);
+        assert_eq!(variable.eval(&program_v, &enc, x), want);
+        let enc = folded_scheme.encode(&ek_f, &keep(x));
+        assert_eq!(folded_scheme.eval(&program_f, &enc, &keep(x)), want);
+    }
+}
+
+/// The labels are masked: none equals `0` or `ξ_i` in the clear, which is what an
+/// unmasked `c_t·ξ_i` would be, and no two entries or scalars share an offset.
+#[test]
+fn group_layer_masks_statement_labels() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 2);
+    let scheme = group_scheme(&inst.vk);
+    let (_, ek) = scheme.garble(&mut rng, &SECRET);
+    let enc = scheme.encode(&ek, &inst.valid);
+    let mut seen = std::collections::HashSet::new();
+    for (i, labels) in enc.inputs.iter().enumerate() {
+        for &z in labels {
+            assert!(!z.is_zero() && z != inst.valid.inputs[i]);
+        }
+    }
+    for keys in &ek.input_keys {
+        for rho in keys {
+            assert!(seen.insert(*rho), "an offset repeats");
+        }
+    }
+}
+
+/// The change of variables behind privacy on a valid proof. After the DDH step the
+/// `B` keys are independent `S_t`, and flipping `c_t` by `Δ` while shifting
+/// `S_t`, `K^C_t` and `ρ_{i,t}` by `Δ` times the input leaves every label in place
+/// and moves `K_t` by `Δ·P`. So on a valid proof the view does not depend on `c_t`,
+/// and on an invalid one the shifted key misses the commitment.
+#[test]
+fn statement_shift_preserves_the_view_exactly_when_the_proof_is_valid() {
+    use grover::curve::{h_com, multi_pair, Gt};
+
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 2);
+    let scheme = group_scheme(&inst.vk);
+    let vk = &inst.vk;
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+
+    let sum_at = |xs: &[Fr]| {
+        vk.input_bases
+            .iter()
+            .zip(xs)
+            .fold(G1::zero(), |acc, (b, x)| acc + *b * *x)
+    };
+    for (x, valid) in [(&inst.valid, true), (&inst.invalid, false)] {
+        let enc = scheme.encode(&ek, x);
+        let q = enc.a.iter().rev().fold(G1::zero(), |acc, p| acc + acc + *p);
+        for t in 0..KAPPA {
+            let u = program.bases[t];
+            let key = |c: bool, s: Twist, k_c: G1, rho: &[Fr]| -> Gt {
+                let base = multi_pair([q, x.a, k_c, sum_at(rho)], [u, s, vk.h1, vk.h2]);
+                if c {
+                    base + vk.d
+                } else {
+                    base
+                }
+            };
+            let rho: Vec<Fr> = ek.input_keys.iter().map(|keys| keys[t]).collect();
+            let c = ek.coeffs[t];
+            let k = key(c, ek.b_keys[t], ek.c_keys[t], &rho);
+            assert_eq!(h_com(SID, t, &k), program.commits[t], "the honest key");
+
+            // Flip c_t: Δ = c_t − c'_t.
+            let flipped = !c;
+            let delta = if c { Fr::one() } else { -Fr::one() };
+            let s2 = ek.b_keys[t] + x.b * delta;
+            let k_c2 = ek.c_keys[t] + x.c * delta;
+            let rho2: Vec<Fr> = rho
+                .iter()
+                .zip(&x.inputs)
+                .map(|(r, xi)| *r + delta * *xi)
+                .collect();
+
+            let on = |c: bool, xi: Fr, r: Fr| if c { xi + r } else { r };
+            for (i, (xi, r)) in x.inputs.iter().zip(&rho2).enumerate() {
+                assert_eq!(on(flipped, *xi, *r), enc.inputs[i][t]);
+            }
+            let same_b = if flipped { x.b + s2 } else { s2 };
+            assert_eq!(same_b, enc.b[t]);
+            let same_c = if flipped { x.c + k_c2 } else { k_c2 };
+            assert_eq!(same_c, enc.c[t]);
+
+            assert_eq!(key(flipped, s2, k_c2, &rho2) == k, valid, "entry {t}");
+        }
+    }
+}
+
+/// A zero scalar still has labels, `z_{i,t} = ρ_{i,t}`, and they still decode.
+#[test]
+fn group_layer_handles_a_zero_statement_scalar() {
+    let mut rng = ark_std::test_rng();
+    let mut inst = synthetic_with_inputs(&mut rng, 1);
+    let delta = inst.vk.input_bases[0] * inst.valid.inputs[0];
+    inst.vk.d -= grover::curve::pair(&delta, &inst.vk.h2);
+    inst.valid.inputs[0] = Fr::zero();
+    inst.invalid.inputs[0] = Fr::zero();
+    assert!(inst.vk.is_valid(&inst.valid));
+
+    let scheme = group_scheme(&inst.vk);
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let enc = scheme.encode(&ek, &inst.valid);
+    assert_eq!(scheme.eval(&program, &enc, &inst.valid), None);
+    let enc = scheme.encode(&ek, &inst.invalid);
+    assert_eq!(scheme.eval(&program, &enc, &inst.invalid), Some(SECRET));
+}
+
+/// Off the subgroup, the labels on `B` open `s` whatever the statement is.
+#[test]
+fn group_layer_discloses_off_the_subgroup_with_a_statement() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 2);
+    let scheme = group_scheme(&inst.vk);
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let bad = ProofPoints {
+        b: twist_point_off_g2(&mut rng),
+        ..inst.valid.clone()
+    };
+    let enc = scheme.encode(&ek, &bad);
+    assert_eq!(scheme.eval(&program, &enc, &bad), Some(SECRET));
+}
+
+/// The labels of two different statements under one key subtract to
+/// `c_t·(ξ' − ξ)`, which recovers `c⃗` and the pad without any proof at all. So the
+/// surrounding protocol must release the labels of only one statement per garbling.
+#[test]
+fn reusing_statement_labels_recovers_the_secret() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = group_scheme(&inst.vk);
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+
+    let mut other = inst.valid.clone();
+    other.inputs[0] += Fr::rand(&mut rng);
+    let first = scheme.encode(&ek, &inst.valid);
+    let second = scheme.encode(&ek, &other);
+
+    let delta = other.inputs[0] - inst.valid.inputs[0];
+    let recovered: Vec<u8> = (0..KAPPA)
+        .map(|t| {
+            let d = second.inputs[0][t] - first.inputs[0][t];
+            assert!(d.is_zero() || d == delta);
+            !d.is_zero() as u8
+        })
+        .collect();
+    assert_eq!(xor(&program.ct, &h_key(SID, &recovered)), SECRET);
+}
+
+/// A statement of the wrong shape, or a wrong or truncated statement label, must
+/// disclose nothing and must not panic.
+#[test]
+fn group_layer_rejects_malformed_statement_material() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 2);
+    let scheme = group_scheme(&inst.vk);
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let enc = scheme.encode(&ek, &inst.invalid);
+
+    let mut short = inst.invalid.clone();
+    short.inputs.pop();
+    assert_eq!(scheme.eval(&program, &enc, &short), None);
+    assert_eq!(inst.vk.verdict(&short), None);
+
+    let mut bad = enc.clone();
+    bad.inputs.pop();
+    assert_eq!(scheme.eval(&program, &bad, &inst.invalid), None);
+
+    let mut bad = enc.clone();
+    bad.inputs[1].pop();
+    assert_eq!(scheme.eval(&program, &bad, &inst.invalid), None);
+
+    let mut bad = enc.clone();
+    bad.inputs[0][3] += Fr::one();
+    assert_eq!(scheme.eval(&program, &bad, &inst.invalid), None);
+}
+
+#[test]
+#[should_panic(expected = "one statement scalar per garbled input")]
+fn group_layer_refuses_to_encode_the_wrong_statement_shape() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 2);
+    let scheme = group_scheme(&inst.vk);
+    let (_, ek) = scheme.garble(&mut rng, &SECRET);
+    let mut short = inst.valid.clone();
+    short.inputs.pop();
+    let _ = scheme.encode(&ek, &short);
+}
+
+#[test]
+fn field_layer_decides_the_statement_online() {
+    let mut rng = ark_std::test_rng();
+    for ell in ELLS {
+        let inst = synthetic_with_inputs(&mut rng, ell);
+        let scheme = field_scheme(&inst.vk);
+        let (program, ek) = scheme.garble(&mut rng, &SECRET);
+
+        let valid = ProofCoords::from_points(&inst.valid).unwrap();
+        let enc = scheme.encode(&ek, &valid);
+        assert_eq!(scheme.eval(&program, &enc, &valid), None, "ell {ell}");
+
+        let mut other = valid.clone();
+        other.inputs[ell - 1] += Fr::one();
+        let enc = scheme.encode(&ek, &other);
+        assert_eq!(
+            scheme.eval(&program, &enc, &other),
+            Some(SECRET),
+            "ell {ell}"
+        );
+
+        // Off-curve discloses through the curve check, with the statement present.
+        let mut off = valid.clone();
+        off.a.1 += Fq::one();
+        let enc = scheme.encode(&ek, &off);
+        assert_eq!(scheme.eval(&program, &enc, &off), Some(SECRET), "ell {ell}");
+    }
+}
+
+#[test]
+fn field_layer_discloses_on_a_proof_aimed_at_the_masks_with_a_statement() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = field_scheme(&inst.vk);
+    let (program, ek_f, ek_g) = scheme.garble_parts(&mut rng, &SECRET);
+    let i = ek_g.a_coeffs.iter().position(|&c| c).unwrap();
+    let aimed = ProofPoints {
+        a: ek_g.a_keys[i],
+        ..inst.valid.clone()
+    };
+    let x = ProofCoords::from_points(&aimed).unwrap();
+    let enc = scheme.encode(&ek_f, &x);
+    assert_eq!(scheme.eval(&program, &enc, &x), Some(SECRET));
+}
+
+#[test]
+fn field_layer_rejects_malformed_statement_material() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = field_scheme(&inst.vk);
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let x = ProofCoords::from_points(&inst.invalid).unwrap();
+    let enc = scheme.encode(&ek, &x);
+
+    let mut short = x.clone();
+    short.inputs.clear();
+    assert_eq!(scheme.eval(&program, &enc, &short), None);
+
+    let mut bad = enc.clone();
+    bad.inputs.clear();
+    assert_eq!(scheme.eval(&program, &bad, &x), None);
+
+    let mut bad = enc.clone();
+    bad.inputs[0].pop();
+    assert_eq!(scheme.eval(&program, &bad, &x), None);
+}
+
+#[test]
+fn bit_layer_decides_the_statement_online() {
+    let mut rng = ark_std::test_rng();
+    for ell in ELLS {
+        let inst = synthetic_with_inputs(&mut rng, ell);
+        let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+        let (program, ek) = scheme.garble(&mut rng, &SECRET);
+        assert_eq!(program.1.instances.len(), 8 + ell);
+
+        let coords = ProofCoords::from_points(&inst.valid).unwrap();
+        let valid = ProofBits::from_coords(&coords);
+        assert_eq!(BinToField.apply(&valid), coords);
+        let enc = scheme.encode(&ek, &valid);
+        assert_eq!(scheme.eval(&program, &enc, &valid), None, "ell {ell}");
+
+        let mut other = coords.clone();
+        other.inputs[0] += Fr::one();
+        let other = ProofBits::from_coords(&other);
+        let enc = scheme.encode(&ek, &other);
+        assert_eq!(
+            scheme.eval(&program, &enc, &other),
+            Some(SECRET),
+            "ell {ell}"
+        );
+
+        let invalid = ProofBits::from_coords(&ProofCoords::from_points(&inst.invalid).unwrap());
+        let enc = scheme.encode(&ek, &invalid);
+        assert_eq!(
+            scheme.eval(&program, &enc, &invalid),
+            Some(SECRET),
+            "ell {ell}"
+        );
+    }
+}
+
+/// `ι_bin` reduces a statement block modulo `r`: the block of `ξ + r` describes the
+/// same statement and seals, like a coordinate plus `p`. A deployed verifier would
+/// reject it instead.
+#[test]
+fn bit_layer_reduces_a_non_canonical_statement_block() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let coords = ProofCoords::from_points(&inst.valid).unwrap();
+    let mut x = ProofBits::from_coords(&coords);
+
+    let mut big = coords.inputs[0].into_bigint();
+    if big.add_with_carry(&Fr::MODULUS) {
+        panic!("ξ + r fits in 256 bits");
+    }
+    x.inputs[0].copy_from_slice(&big.to_bytes_le()[..32]);
+    assert_ne!(x.inputs[0], fr_to_block(coords.inputs[0]));
+    assert_eq!(BinToField.apply(&x), coords);
+
+    let enc = scheme.encode(&ek, &x);
+    assert_eq!(scheme.eval(&program, &enc, &x), None);
+
+    // A valid proof returns before reading the labels, so check that they decode
+    // through a block above `r` on an invalid proof.
+    let mut bad = ProofBits::from_coords(&ProofCoords::from_points(&inst.invalid).unwrap());
+    bad.inputs[0] = x.inputs[0];
+    let enc = scheme.encode(&ek, &bad);
+    assert_eq!(scheme.eval(&program, &enc, &bad), Some(SECRET));
+}
+
+/// A block near `2^256`, far above `r`, decodes through the smudging without
+/// wrapping the CRT modulus.
+#[test]
+fn bit_layer_decodes_the_largest_statement_block() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let mut x = ProofBits::from_coords(&ProofCoords::from_points(&inst.valid).unwrap());
+    x.inputs[0] = [0xFF; 32];
+    let enc = scheme.encode(&ek, &x);
+    // All-ones is not the statement this proof is for.
+    assert_eq!(scheme.eval(&program, &enc, &x), Some(SECRET));
+}
+
+#[test]
+fn bit_layer_rejects_a_missing_statement_instance() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+    let (mut program, ek) = scheme.garble(&mut rng, &SECRET);
+    let invalid = ProofBits::from_coords(&ProofCoords::from_points(&inst.invalid).unwrap());
+    let enc = scheme.encode(&ek, &invalid);
+
+    // The evaluator's statement has the wrong shape for the program.
+    let mut short = invalid.clone();
+    short.inputs.clear();
+    assert_eq!(scheme.eval(&program, &enc, &short), None);
+
+    program.1.instances.pop();
+    assert_eq!(scheme.eval(&program, &enc, &invalid), None);
+}
+
+#[test]
+#[should_panic(expected = "aggregate target")]
+fn bit_scheme_refuses_too_many_statement_scalars() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, grover::bits::MAX_INPUTS + 1);
+    let _ = bit_scheme(inst.vk, SID.to_vec());
+}
+
+#[test]
+fn bit_layer_runs_at_the_largest_statement() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, grover::bits::MAX_INPUTS);
+    let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let valid = ProofBits::from_coords(&ProofCoords::from_points(&inst.valid).unwrap());
+    let enc = scheme.encode(&ek, &valid);
+    assert_eq!(scheme.eval(&program, &enc, &valid), None);
+    let invalid = ProofBits::from_coords(&ProofCoords::from_points(&inst.invalid).unwrap());
+    let enc = scheme.encode(&ek, &invalid);
+    assert_eq!(scheme.eval(&program, &enc, &invalid), Some(SECRET));
+}
+
+/// More statement blocks than the program has instances, or the reverse, disclose
+/// nothing rather than panic.
+#[test]
+fn bit_layer_rejects_extra_statement_material() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+    let (program, ek) = scheme.garble(&mut rng, &SECRET);
+    let invalid = ProofBits::from_coords(&ProofCoords::from_points(&inst.invalid).unwrap());
+    let enc = scheme.encode(&ek, &invalid);
+
+    let mut long = invalid.clone();
+    long.inputs.push([0u8; 32]);
+    assert_eq!(scheme.eval(&program, &enc, &long), None);
+
+    // A program garbled for two scalars, evaluated against a statement of one.
+    let wider = synthetic_with_inputs(&mut rng, 2);
+    let (other, _) = bit_scheme(wider.vk, SID.to_vec()).garble(&mut rng, &SECRET);
+    assert_eq!(scheme.eval(&other, &enc, &invalid), None);
+}
+
+#[test]
+#[should_panic(expected = "one statement scalar per garbled input")]
+fn field_layer_refuses_to_encode_the_wrong_statement_shape() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = field_scheme(&inst.vk);
+    let (_, ek) = scheme.garble(&mut rng, &SECRET);
+    let mut short = ProofCoords::from_points(&inst.valid).unwrap();
+    short.inputs.clear();
+    let _ = scheme.encode(&ek, &short);
+}
+
+#[test]
+#[should_panic(expected = "one statement scalar per garbled input")]
+fn bit_layer_refuses_to_encode_the_wrong_statement_shape() {
+    let mut rng = ark_std::test_rng();
+    let inst = synthetic_with_inputs(&mut rng, 1);
+    let scheme = bit_scheme(inst.vk.clone(), SID.to_vec());
+    let (_, ek) = scheme.garble(&mut rng, &SECRET);
+    let mut short = ProofBits::from_coords(&ProofCoords::from_points(&inst.valid).unwrap());
+    short.inputs.clear();
+    let _ = scheme.encode(&ek, &short);
 }
 
 // ------------------------------------------------------------------- timing

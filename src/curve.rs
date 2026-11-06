@@ -158,11 +158,6 @@ pub fn p_limbs() -> [u64; 4] {
     Fq::MODULUS.0
 }
 
-/// An `F_p` element as little-endian limbs.
-pub fn fq_limbs(x: Fq) -> [u64; 4] {
-    x.into_bigint().0
-}
-
 /// A little-endian 256-bit block as an element of `F_p`, reduced modulo `p`.
 /// This is the map `ι_bin` on one block.
 pub fn block_to_fq(block: &[u8; 32]) -> Fq {
@@ -171,6 +166,20 @@ pub fn block_to_fq(block: &[u8; 32]) -> Fq {
 
 /// The canonical 256-bit block of an `F_p` element.
 pub fn fq_to_block(x: Fq) -> [u8; 32] {
+    let bytes = x.into_bigint().to_bytes_le();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes[..32]);
+    out
+}
+
+/// A little-endian 256-bit block as an element of `F_r`, reduced modulo `r`.
+/// This is the map `ι_bin` on the block of a statement scalar.
+pub fn block_to_fr(block: &[u8; 32]) -> Fr {
+    Fr::from_le_bytes_mod_order(block)
+}
+
+/// The canonical 256-bit block of an `F_r` element.
+pub fn fr_to_block(x: Fr) -> [u8; 32] {
     let bytes = x.into_bigint().to_bytes_le();
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes[..32]);

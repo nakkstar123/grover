@@ -1,16 +1,17 @@
 //! `Π_F`: the scheme over fields.
 //!
-//! The evaluator's input is the proof as six coordinates. On-curve, this is
-//! `Π_G ∘_{ι_F} Π_1`, where `Π_1` garbles the three Argo encodings from
-//! coordinates ([`crate::pointenc`]). Off-curve, three garbled polynomials
-//! `s·g_V(u, v)` (one per proof point) release `s` instead: they vanish on the
-//! curves, hiding `s` statistically there, and off-curve the evaluator divides
-//! by the public `g_V(u, v)`. Branching is on the public curve equations, not
-//! the garbled values, so the output is `s` off-curve even when `s = 0`. The
+//! The evaluator's input is the proof as six coordinates and the `ℓ` statement
+//! scalars. On-curve, this is `Π_G ∘_{ι_F} Π_1`, where `Π_1` garbles the three
+//! Argo encodings from coordinates ([`crate::pointenc`]) and passes the statement
+//! labels through, as they are already affine over `F_r`. Off-curve, three garbled
+//! polynomials `s·g_V(u, v)` (one per proof point) release `s` instead: they vanish
+//! on the curves, hiding `s` statistically there, and off-curve the evaluator
+//! divides by the public `g_V(u, v)`. Branching is on the public curve equations,
+//! not the garbled values, so the output is `s` off-curve even when `s = 0`. The
 //! garbled program is `f~_G` itself.
 //!
-//! Label positions are a fixed public [`FieldLayout`], determined by `n` and
-//! `κ` alone.
+//! Label positions are a fixed public [`FieldLayout`], determined by `n`, `κ` and
+//! `ℓ` alone.
 
 use crate::curve::{
     b1, b2, fq_to_secret, g1_coords, g1_eq, g1_from_coords, g2_eq, secret_to_fq, twist_coords,
@@ -19,15 +20,15 @@ use crate::curve::{
 use crate::group::{
     self, GroupEncoding, GroupEncodingInfo, GroupProgram, GroupScheme, ProofPoints, Verifier,
 };
-use crate::itpg::{self, CoordLabels, CoordValues, Cursor, Layout, Monomial, Poly, Shape};
+use crate::itpg::{self, Affine, CoordLabels, CoordValues, Cursor, Layout, Monomial, Poly, Shape};
 use crate::pgs::Pgs;
 use crate::pointenc::{self, CurveG1, CurveTwist, EntryLayout};
-use ark_bn254::{Fq, Fq2};
+use ark_bn254::{Fq, Fq2, Fr};
 use ark_ff::{Field, Zero};
 use ark_std::rand::RngCore;
 
 /// A proof as field elements: the evaluator's input at this layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofCoords {
     /// `(A_u, A_v) ∈ F_p²`.
     pub a: (Fq, Fq),
@@ -35,6 +36,8 @@ pub struct ProofCoords {
     pub b: (Fq2, Fq2),
     /// `(C_u, C_v) ∈ F_p²`.
     pub c: (Fq, Fq),
+    /// The statement scalars `ξ_i ∈ F_r`.
+    pub inputs: Vec<Fr>,
 }
 
 impl ProofCoords {
@@ -45,6 +48,7 @@ impl ProofCoords {
             a: g1_from_coords(self.a.0, self.a.1)?,
             b: twist_from_coords(self.b.0, self.b.1)?,
             c: g1_from_coords(self.c.0, self.c.1)?,
+            inputs: self.inputs.clone(),
         })
     }
 
@@ -54,6 +58,7 @@ impl ProofCoords {
             a: g1_coords(&x.a)?,
             b: twist_coords(&x.b)?,
             c: g1_coords(&x.c)?,
+            inputs: x.inputs.clone(),
         })
     }
 }
@@ -106,15 +111,19 @@ pub struct FieldLayout {
     pub b: PointLayout,
     /// Labels on `C`: `κ` entries and one check.
     pub c: PointLayout,
+    /// The number `ℓ` of statement scalars, each with `κ` labels over `F_r`.
+    pub inputs: usize,
 }
 
 impl FieldLayout {
-    /// The layout for the scheme's fixed parameters, `n = 254` and `κ = 128`.
-    pub fn new() -> Self {
+    /// The layout for `ℓ` statement scalars and the scheme's fixed parameters,
+    /// `n = 254` and `κ = 128`.
+    pub fn new(inputs: usize) -> Self {
         Self {
             a: PointLayout::new(group::N),
             b: PointLayout::new(group::KAPPA),
             c: PointLayout::new(group::KAPPA),
+            inputs,
         }
     }
 
@@ -124,17 +133,11 @@ impl FieldLayout {
         (n(&self.a), n(&self.b), n(&self.c))
     }
 
-    /// `N_base = S_A + 4·S_B + S_C`, the base-field entries after splitting the
-    /// extension-field labels of `B`.
+    /// `S_A + 4·S_B + S_C + ℓκ`, the entries after splitting the extension-field
+    /// labels of `B`, which is `N_base` when `ℓ = 0`.
     pub fn base_field_entries(&self) -> usize {
         let (sa, sb, sc) = self.entry_counts();
-        sa + 4 * sb + sc
-    }
-}
-
-impl Default for FieldLayout {
-    fn default() -> Self {
-        Self::new()
+        sa + 4 * sb + sc + self.inputs * group::KAPPA
     }
 }
 
@@ -147,6 +150,8 @@ pub struct FieldEncodingInfo {
     pub b: CoordLabels<Fq2>,
     /// Labels on `C_u, C_v`.
     pub c: CoordLabels<Fq>,
+    /// Labels on each `ξ_i`.
+    pub inputs: Vec<Vec<Affine<Fr>>>,
 }
 
 /// The encoding `x~_F`: the label values.
@@ -163,6 +168,8 @@ pub struct FieldEncoding {
     pub b: CoordValues<Fq2>,
     /// Values on `C`.
     pub c: CoordValues<Fq>,
+    /// Values on each `ξ_i`.
+    pub inputs: Vec<Vec<Fr>>,
 }
 
 /// The scheme over fields.
@@ -190,7 +197,7 @@ impl FieldScheme {
         s: &Secret,
     ) -> (GroupProgram, FieldEncodingInfo, GroupEncodingInfo) {
         let (program, ek_g) = self.group.garble(rng, s);
-        let layout = FieldLayout::new();
+        let layout = FieldLayout::new(self.group.vk.input_bases.len());
         let s_fq = secret_to_fq(s);
         let s_fq2 = Fq2::new(s_fq, Fq::zero());
 
@@ -244,7 +251,23 @@ impl FieldScheme {
             &mut c,
         );
 
-        (program, FieldEncodingInfo { a, b, c }, ek_g)
+        // The statement labels are already affine in ξ_i.
+        let inputs = ek_g
+            .input_keys
+            .iter()
+            .map(|keys| {
+                ek_g.coeffs
+                    .iter()
+                    .zip(keys)
+                    .map(|(&c, &rho)| Affine {
+                        a: Fr::from(c),
+                        b: rho,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        (program, FieldEncodingInfo { a, b, c, inputs }, ek_g)
     }
 }
 
@@ -268,15 +291,26 @@ impl Pgs for FieldScheme {
     }
 
     fn encode(&self, ek: &FieldEncodingInfo, x: &ProofCoords) -> FieldEncoding {
+        assert_eq!(
+            x.inputs.len(),
+            ek.inputs.len(),
+            "one statement scalar per garbled input"
+        );
         FieldEncoding {
             a: itpg::encode(&ek.a, x.a.0, x.a.1),
             b: itpg::encode(&ek.b, x.b.0, x.b.1),
             c: itpg::encode(&ek.c, x.c.0, x.c.1),
+            inputs: x
+                .inputs
+                .iter()
+                .zip(&ek.inputs)
+                .map(|(&xi, labels)| labels.iter().map(|l| l.at(xi)).collect())
+                .collect(),
         }
     }
 
     fn eval(&self, program: &GroupProgram, enc: &FieldEncoding, x: &ProofCoords) -> Option<Secret> {
-        let layout = FieldLayout::new();
+        let layout = FieldLayout::new(self.group.vk.input_bases.len());
         // The party that publishes the program is the one that wants disclosure
         // not to happen, so malformed garbled material must return bottom rather
         // than abort the challenger. The group layer guards its lengths the same
@@ -284,6 +318,8 @@ impl Pgs for FieldScheme {
         if (enc.a.u.len(), enc.a.v.len()) != (layout.a.total.u, layout.a.total.v)
             || (enc.b.u.len(), enc.b.v.len()) != (layout.b.total.u, layout.b.total.v)
             || (enc.c.u.len(), enc.c.v.len()) != (layout.c.total.u, layout.c.total.v)
+            || enc.inputs.len() != layout.inputs
+            || x.inputs.len() != layout.inputs
         {
             return None;
         }
@@ -310,6 +346,7 @@ impl Pgs for FieldScheme {
             a: pointenc::eval_entries::<CurveG1>(&layout.a.entries, &enc.a, x.a.0, x.a.1)?,
             b: pointenc::eval_entries::<CurveTwist>(&layout.b.entries, &enc.b, x.b.0, x.b.1)?,
             c: pointenc::eval_entries::<CurveG1>(&layout.c.entries, &enc.c, x.c.0, x.c.1)?,
+            inputs: enc.inputs.clone(),
         };
         self.group.eval(program, &group_encoding, &points)
     }
@@ -322,7 +359,7 @@ mod tests {
     /// The main-body entry count: 10,758 base-field entries.
     #[test]
     fn entry_counts_are_10758() {
-        let layout = FieldLayout::new();
+        let layout = FieldLayout::new(0);
         let (sa, sb, sc) = layout.entry_counts();
         assert_eq!((sa, sb, sc), (12 * 254 + 5, 12 * 128 + 5, 12 * 128 + 5));
         assert_eq!((sa, sb, sc), (3053, 1541, 1541));

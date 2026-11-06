@@ -1,36 +1,39 @@
 //! `Π_bin`: the scheme over bits.
 //!
 //! The evaluator's input is eight 256-bit blocks: two each for `A` and `C`,
-//! four for `B` (the two `F_p` components of each `F_{p^2}` coordinate). The
-//! map `ι_bin` reads each block as an integer and reduces it modulo `p`,
-//! so an out-of-range block is reduced rather than rejected.
+//! four for `B` (the two `F_p` components of each `F_{p^2}` coordinate), and one
+//! more per statement scalar. The map `ι_bin` reads each block as an integer and
+//! reduces it modulo `p`, or modulo `r` for a statement scalar, so an out-of-range
+//! block is reduced rather than rejected.
 //!
 //! `Π_2` garbles the field-layer encoding function, a vector of affine maps
-//! `a·x + b`: one Duty-Free Bits instance per `F_p` coordinate. An
+//! `a·x + b`: one Duty-Free Bits instance per coordinate. An
 //! `F_{p^2}`-affine label `a·(x_0 + η x_1) + b` (`η² = −1`) splits as
 //! `(a x_0 + T) + ((aη) x_1 + (b − T))` for uniform `T`, giving two `F_p`-affine
 //! labels per component, which the evaluator adds back together.
 //!
 //! Each DFB instance computes `a·X + b` over the CRT ring `Z_M`. To hide the
-//! integer quotient `⌊(a·X + b)/p⌋ < 2^256`, the garbler smudges every offset
-//! as `b + μ·p` for uniform `μ ∈ [0, 2^MU_BITS)`; the evaluator reduces the
-//! reconstructed integer mod `p`. This hides the quotient to distance `2^-ρ`
-//! per label, `ρ = MU_BITS − W` ([`RHO`]); [`BitEncoder::new`] checks the
-//! no-wrap bound `p·(2^MU_BITS + 2^W + 1) < M`.
+//! integer quotient `⌊(a·X + b)/q⌋ < 2^256` for the target modulus `q ∈ {p, r}`,
+//! the garbler smudges every offset as `b + μ·q` for uniform
+//! `μ ∈ [0, 2^MU_BITS)`; the evaluator reduces the reconstructed integer mod `q`.
+//! This hides the quotient to distance `2^-ρ` per label, `ρ = MU_BITS − W`
+//! ([`RHO`]); [`BitEncoder::new`] checks the no-wrap bound
+//! `p·(2^MU_BITS + 2^W + 1) < M`, which covers `r` too since `r < p`.
 //!
 //! The target is 40 bits of statistical security in aggregate: the evaluator
-//! sees every label, so what matters is `N_base·2^-ρ`, not the per-label
+//! sees every label, so what matters is `n_base(ℓ)·2^-ρ`, not the per-label
 //! `2^-ρ`. With `N_base = 10,758` that costs about 14 bits, so `ρ = 54`
-//! ([`statistical_target_is_met`] checks the aggregate directly).
+//! ([`statistical_target_is_met`] checks the aggregate directly), which leaves
+//! room for [`MAX_INPUTS`] statement scalars.
 //!
 //! `ι_bin` reads each block least-significant-bit first; a deployed verifier's
 //! own serialization convention is a proof-format concern, not this scheme's.
 
-use crate::curve::{block_to_fq, fq_limbs, fq_to_block, p_limbs};
+use crate::curve::{block_to_fq, block_to_fr, fq_to_block, fr_to_block, p_limbs};
 use crate::field::{FieldEncoding, FieldEncodingInfo, FieldScheme, ProofCoords};
 use crate::itpg::{Affine, CoordValues};
 use crate::pgs::{Compose, Pgs, PublicMap};
-use ark_bn254::{Fq, Fq2};
+use ark_bn254::{Fq, Fq2, Fr};
 use ark_ff::{BigInt, BigInteger, PrimeField, UniformRand};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::RngCore;
@@ -71,10 +74,19 @@ pub const FIRST_82_PRIMES: [u64; 82] = [
 /// from its own per-point layout.
 pub const N_BASE: usize = 12 * crate::group::N + 60 * crate::group::KAPPA + 30;
 
-/// The aggregate statistical security, in bits, of projectivizing `N_BASE`
-/// labels: the per-label smudging distance `2^-ρ` times the number of labels.
-pub fn aggregate_statistical_bits() -> f64 {
-    RHO as f64 - (N_BASE as f64).log2()
+/// The most statement scalars that still meet the 40-bit aggregate target.
+pub const MAX_INPUTS: usize = 43;
+
+/// The entry count with `ℓ` statement scalars, `N_base + ℓκ`.
+pub const fn n_base(ell: usize) -> usize {
+    N_BASE + ell * crate::group::KAPPA
+}
+
+/// The aggregate statistical security, in bits, of projectivizing the labels of
+/// `ℓ` statement scalars and the proof: the per-label smudging distance `2^-ρ`
+/// times the number of labels.
+pub fn aggregate_statistical_bits(ell: usize) -> f64 {
+    RHO as f64 - (n_base(ell) as f64).log2()
 }
 
 /// The eight blocks, in the order used throughout this module.
@@ -101,11 +113,13 @@ pub enum Block {
 /// Number of blocks.
 pub const NUM_BLOCKS: usize = 8;
 
-/// A proof as bits: eight little-endian 256-bit blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A proof as bits: little-endian 256-bit blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofBits {
     /// The blocks, indexed by [`Block`].
     pub blocks: [[u8; 32]; NUM_BLOCKS],
+    /// The blocks of the statement scalars.
+    pub inputs: Vec<[u8; 32]>,
 }
 
 impl ProofBits {
@@ -122,19 +136,26 @@ impl ProofBits {
                 fq_to_block(x.c.0),
                 fq_to_block(x.c.1),
             ],
+            inputs: x.inputs.iter().map(|&xi| fr_to_block(xi)).collect(),
         }
     }
 
-    /// The bits of block `i`, least significant first, as `0`/`1` words.
+    /// The bits of block `i`, least significant first, as `0`/`1` words. The
+    /// blocks of the statement scalars follow the [`Block`]s.
     pub fn bits(&self, i: usize) -> Vec<u64> {
-        self.blocks[i]
+        let block = match i.checked_sub(NUM_BLOCKS) {
+            None => &self.blocks[i],
+            Some(j) => &self.inputs[j],
+        };
+        block
             .iter()
             .flat_map(|byte| (0..8).map(move |j| ((byte >> j) & 1) as u64))
             .collect()
     }
 }
 
-/// The map `ι_bin`: blocks to coordinates, reducing each block modulo `p`.
+/// The map `ι_bin`: blocks to coordinates, reducing each block modulo `p`, or
+/// modulo `r` for a statement scalar.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinToField;
 
@@ -148,6 +169,7 @@ impl PublicMap<ProofBits, ProofCoords> for BinToField {
                 Fq2::new(f(Block::BV0), f(Block::BV1)),
             ),
             c: (f(Block::CU), f(Block::CV)),
+            inputs: x.inputs.iter().map(block_to_fr).collect(),
         }
     }
 }
@@ -173,7 +195,8 @@ impl BitEncoder {
 }
 
 /// Whether `p·(2^MU_BITS + 2^W + 1) < M`, which bounds every smudged integer
-/// `a·X + b + μ·p` below `M` (exact 640-bit arithmetic).
+/// `a·X + b + μ·q` below `M` for `q ∈ {p, r}`, since `r < p` (exact 640-bit
+/// arithmetic).
 fn smudging_fits(params: &CrtParams) -> bool {
     type Wide = BigInt<10>;
     let mut factor = Wide::one();
@@ -199,10 +222,11 @@ impl Default for BitEncoder {
     }
 }
 
-/// The garbled program of `Π_2`: one DFB program per block.
+/// The garbled program of `Π_2`: one DFB program per block, statement blocks
+/// included.
 #[derive(Debug)]
 pub struct BitProgram {
-    /// Indexed by [`Block`].
+    /// Indexed by [`Block`], then by statement scalar.
     pub instances: Vec<dfb::Program>,
 }
 
@@ -220,14 +244,14 @@ impl BitProgram {
 /// The encoding information of `Π_2`: the input-bit masks of each DFB instance.
 #[derive(Debug)]
 pub struct BitEncodingInfo {
-    /// Indexed by [`Block`].
+    /// Indexed by [`Block`], then by statement scalar.
     pub instances: Vec<dfb::EncodingInfo>,
 }
 
 /// The projective encoding: one label per input bit.
 #[derive(Debug)]
 pub struct BitEncoding {
-    /// Indexed by [`Block`].
+    /// Indexed by [`Block`], then by statement scalar.
     pub labels: Vec<dfb::InputLabels>,
 }
 
@@ -240,13 +264,13 @@ fn mod_small(limbs: &[u64], p: u64) -> u64 {
         .fold(0u128, |acc, &l| ((acc << 64) | l as u128) % p) as u64
 }
 
-/// The affine maps `(a, b)` of `F_p` labels.
-fn maps_fq(labels: &[Affine<Fq>]) -> Maps {
+/// The affine maps `(a, b)` of labels over a prime field.
+fn maps_of<F: PrimeField>(labels: &[Affine<F>]) -> Maps<F> {
     labels.iter().map(|l| (l.a, l.b)).collect()
 }
 
 /// The affine maps `(a_j, b_j)` of one DFB instance.
-type Maps = Vec<(Fq, Fq)>;
+type Maps<F = Fq> = Vec<(F, F)>;
 
 /// Split `F_{p^2}` labels into `F_p` maps on the components `x_0` and `x_1`.
 /// Label `j` becomes maps `2j, 2j+1` on each component (the two components of each half).
@@ -267,21 +291,21 @@ fn split_fq2<R: RngCore>(rng: &mut R, labels: &[Affine<Fq2>]) -> (Maps, Maps) {
 }
 
 impl BitEncoder {
-    /// Garble one DFB instance for the maps `a_j·x + b_j` over `F_p`, smudging the
-    /// offsets, and reducing everything to residues.
-    fn garble_instance<R: RngCore>(
+    /// Garble one DFB instance for the maps `a_j·x + b_j` over the field `F_q`,
+    /// smudging the offsets, and reducing everything to residues.
+    fn garble_instance<F: PrimeField, R: RngCore>(
         &self,
         rng: &mut R,
-        maps: &[(Fq, Fq)],
+        maps: &[(F, F)],
     ) -> (dfb::Program, dfb::EncodingInfo) {
-        let p = p_limbs();
+        let q = F::MODULUS;
         let a_res: Vec<Vec<u64>> = self
             .params
             .primes
             .iter()
             .map(|&pi| {
                 maps.iter()
-                    .map(|(a, _)| mod_small(&fq_limbs(*a), pi))
+                    .map(|(a, _)| mod_small(a.into_bigint().as_ref(), pi))
                     .collect()
             })
             .collect();
@@ -301,11 +325,11 @@ impl BitEncoder {
             .primes
             .iter()
             .map(|&pi| {
-                let p_mod = mod_small(&p, pi);
+                let q_mod = mod_small(q.as_ref(), pi);
                 maps.iter()
                     .zip(&mus)
                     .map(|((_, b), mu)| {
-                        (mod_small(&fq_limbs(*b), pi) + mod_small(mu, pi) * p_mod) % pi
+                        (mod_small(b.into_bigint().as_ref(), pi) + mod_small(mu, pi) * q_mod) % pi
                     })
                     .collect()
             })
@@ -315,13 +339,13 @@ impl BitEncoder {
         dfb::garble_from_seed(seed, &self.params, &a_res, &b_res)
     }
 
-    /// Evaluate one DFB instance and reduce the reconstructed integers modulo `p`.
-    fn eval_instance(
+    /// Evaluate one DFB instance and reduce the reconstructed integers modulo `q`.
+    fn eval_instance<F: PrimeField>(
         &self,
         program: &dfb::Program,
         labels: &dfb::InputLabels,
         bits: &[u64],
-    ) -> Vec<Fq> {
+    ) -> Vec<F> {
         let residues = dfb::eval(program, labels, bits);
         let decoder = GarnerDecoder::new(&self.params.primes);
         dfb::by_component(&residues)
@@ -332,7 +356,7 @@ impl BitEncoder {
                 for limb in value.0 {
                     bytes.extend_from_slice(&limb.to_le_bytes());
                 }
-                Fq::from_le_bytes_mod_order(&bytes)
+                F::from_le_bytes_mod_order(&bytes)
             })
             .collect()
     }
@@ -354,19 +378,25 @@ impl Pgs for BitEncoder {
         let (bu0, bu1) = split_fq2(rng, &ek.b.u);
         let (bv0, bv1) = split_fq2(rng, &ek.b.v);
         let per_block: [Maps; NUM_BLOCKS] = [
-            maps_fq(&ek.a.u),
-            maps_fq(&ek.a.v),
+            maps_of(&ek.a.u),
+            maps_of(&ek.a.v),
             bu0,
             bu1,
             bv0,
             bv1,
-            maps_fq(&ek.c.u),
-            maps_fq(&ek.c.v),
+            maps_of(&ek.c.u),
+            maps_of(&ek.c.v),
         ];
-        let mut instances = Vec::with_capacity(NUM_BLOCKS);
-        let mut infos = Vec::with_capacity(NUM_BLOCKS);
+        let total = NUM_BLOCKS + ek.inputs.len();
+        let mut instances = Vec::with_capacity(total);
+        let mut infos = Vec::with_capacity(total);
         for maps in &per_block {
             let (program, info) = self.garble_instance(rng, maps);
+            instances.push(program);
+            infos.push(info);
+        }
+        for labels in &ek.inputs {
+            let (program, info) = self.garble_instance(rng, &maps_of(labels));
             instances.push(program);
             infos.push(info);
         }
@@ -377,9 +407,17 @@ impl Pgs for BitEncoder {
     }
 
     fn encode(&self, ek: &BitEncodingInfo, x: &ProofBits) -> BitEncoding {
+        assert_eq!(
+            x.inputs.len() + NUM_BLOCKS,
+            ek.instances.len(),
+            "one statement scalar per garbled input"
+        );
         BitEncoding {
-            labels: (0..NUM_BLOCKS)
-                .map(|i| dfb::encode(&ek.instances[i], &x.bits(i)))
+            labels: ek
+                .instances
+                .iter()
+                .enumerate()
+                .map(|(i, info)| dfb::encode(info, &x.bits(i)))
                 .collect(),
         }
     }
@@ -390,10 +428,14 @@ impl Pgs for BitEncoder {
         // `None`. Degrade to the empty encoding instead: `FieldScheme::eval`'s
         // own length guard rejects it, so the failure still surfaces as `None`
         // one layer up rather than as a panic here.
-        if program.instances.len() != NUM_BLOCKS || enc.labels.len() != NUM_BLOCKS {
+        let total = NUM_BLOCKS + x.inputs.len();
+        if program.instances.len() != total || enc.labels.len() != total {
             return FieldEncoding::default();
         }
         let out: Vec<Vec<Fq>> = (0..NUM_BLOCKS)
+            .map(|i| self.eval_instance(&program.instances[i], &enc.labels[i], &x.bits(i)))
+            .collect();
+        let inputs: Vec<Vec<Fr>> = (NUM_BLOCKS..total)
             .map(|i| self.eval_instance(&program.instances[i], &enc.labels[i], &x.bits(i)))
             .collect();
         // Reassemble the F_{p^2} values: label j = (half on x_0) + (half on x_1), componentwise.
@@ -416,6 +458,7 @@ impl Pgs for BitEncoder {
                 u: out[Block::CU as usize].clone(),
                 v: out[Block::CV as usize].clone(),
             },
+            inputs,
         }
     }
 }
@@ -423,8 +466,13 @@ impl Pgs for BitEncoder {
 /// The scheme over bits: `Π_F ∘_{ι_bin} Π_2`.
 pub type BitScheme = Compose<FieldScheme, BitEncoder, BinToField>;
 
-/// Build the scheme over bits for a verifier and session identifier.
+/// Build the scheme over bits for a verifier and session identifier. Panics if
+/// the verifier has more than [`MAX_INPUTS`] statement scalars.
 pub fn bit_scheme(vk: crate::group::Verifier, sid: Vec<u8>) -> BitScheme {
+    assert!(
+        vk.input_bases.len() <= MAX_INPUTS,
+        "more statement scalars than the 40-bit aggregate target allows"
+    );
     Compose {
         outer: FieldScheme::new(vk, sid),
         inner: BitEncoder::new(),
@@ -504,7 +552,7 @@ mod tests {
                     .rev()
                     .fold(0u128, |acc, &b| ((acc << 8) | b as u128) % p as u128))
                     as u64;
-                assert_eq!(mod_small(&fq_limbs(x), p), want);
+                assert_eq!(mod_small(&x.into_bigint().0, p), want);
             }
         }
     }
@@ -514,10 +562,59 @@ mod tests {
     #[test]
     fn statistical_target_is_met() {
         assert_eq!(RHO, 54);
-        let bits = aggregate_statistical_bits();
+        let bits = aggregate_statistical_bits(0);
         assert!(bits >= 40.0, "{bits:.2} bits, below the 40-bit target");
         // The per-label figure alone would mislead: N_base costs about 14 bits.
         assert!(bits < RHO as f64 - 13.0);
+    }
+
+    /// [`MAX_INPUTS`] is exactly where the aggregate target stops holding.
+    #[test]
+    fn max_inputs_is_tight() {
+        assert!(aggregate_statistical_bits(MAX_INPUTS) >= 40.0);
+        assert!(aggregate_statistical_bits(MAX_INPUTS + 1) < 40.0);
+    }
+
+    /// The no-wrap bound is only checked for `p`, and only covers `r` if `r < p`.
+    #[test]
+    fn scalar_field_is_below_base_field() {
+        assert!(Fr::MODULUS < Fq::MODULUS);
+    }
+
+    /// One DFB instance over `F_r` computes `a·ξ + b` modulo `r` rather than `p`,
+    /// for the binary coefficients of the statement labels and at the extremes of
+    /// the 256-bit input range.
+    #[test]
+    fn scalar_instance_reduces_modulo_r() {
+        let mut rng = ark_std::test_rng();
+        let encoder = BitEncoder::new();
+        let labels: Vec<Affine<Fr>> = [false, true, true, false]
+            .iter()
+            .map(|&c| Affine {
+                a: Fr::from(c),
+                b: Fr::rand(&mut rng),
+            })
+            .collect();
+        let (program, info) = encoder.garble_instance(&mut rng, &maps_of(&labels));
+        for block in [[0u8; 32], [0xFF; 32], fr_to_block(-Fr::from(1u64))] {
+            let bits: Vec<u64> = block
+                .iter()
+                .flat_map(|byte| (0..8).map(move |j| ((byte >> j) & 1) as u64))
+                .collect();
+            let enc = dfb::encode(&info, &bits);
+            let got: Vec<Fr> = encoder.eval_instance(&program, &enc, &bits);
+            let xi = block_to_fr(&block);
+            let want: Vec<Fr> = labels.iter().map(|l| l.at(xi)).collect();
+            assert_eq!(got, want);
+
+            // The evaluator sees the integer before reducing it. Unsmudged, it is
+            // `c·X + ρ < 2^257`, which would give away `c`.
+            let decoder = GarnerDecoder::new(&encoder.params.primes);
+            for res in dfb::by_component(&dfb::eval(&program, &enc, &bits)) {
+                let value = decoder.reconstruct(&res);
+                assert!(value.0[5..].iter().any(|&limb| limb != 0), "not smudged");
+            }
+        }
     }
 
     /// The no-wrap bound holds at the chosen `μ` width, and the ring's own
